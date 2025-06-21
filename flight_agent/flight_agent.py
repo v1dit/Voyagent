@@ -4,6 +4,7 @@ import re
 from dotenv import load_dotenv
 from datetime import datetime
 import logging
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -12,6 +13,7 @@ logger = logging.getLogger('flight_agent')
 # Load environment variables
 load_dotenv()
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
+FLYSCRAPER_HOST = os.getenv("FLYSCRAPER_HOST", "flyscraper.p.rapidapi.com")
 
 class FlightAgent:
     def __init__(self):
@@ -115,10 +117,10 @@ class FlightAgent:
         origin_sky_id = self._get_sky_id(origin)
         dest_sky_id = self._get_sky_id(destination)
 
-        url = "https://flyscraper.p.rapidapi.com/flight/search"
+        url = f"https://{FLYSCRAPER_HOST}/flight/search"
         headers = {
             "X-RapidAPI-Key": self.api_key,
-            "X-RapidAPI-Host": "flyscraper.p.rapidapi.com"
+            "X-RapidAPI-Host": FLYSCRAPER_HOST,
         }
         
         # Format date as required by API (YYYY-MM-DD)
@@ -132,8 +134,10 @@ class FlightAgent:
             "adults": passengers,
             "cabinClass": "economy",
             "currency": "USD",
-            "sort": "best"  # Default to best flights
+            "sort": "best",  # Default to best flights
         }
+        if return_date:
+            params["returnDate"] = return_date
 
         logger.info(f"Searching flights: {origin_sky_id} -> {dest_sky_id} on {departure_formatted}")
         
@@ -141,16 +145,26 @@ class FlightAgent:
             response = requests.get(url, headers=headers, params=params)
             logger.info(f"API request URL: {response.url}")
             response.raise_for_status()
-            
+
             data = response.json()
-            
-            # Check if we need to handle incomplete results
-            if data.get("data", {}).get("context", {}).get("status") == "incomplete":
-                # In a real implementation, you'd call the /flight/search-incomplete endpoint
-                # until the status is 'complete', but for simplicity we'll just return what we have
-                logger.warning("Received incomplete results. In production, should poll until complete.")
-            
-            # Process the flight results to extract useful information
+
+            status = data.get("data", {}).get("context", {}).get("status")
+            if status == "incomplete":
+                # Poll the incomplete endpoint until results are ready or timeout
+                session_id = data.get("data", {}).get("context", {}).get("sessionId")
+                polling_url = data.get("data", {}).get("context", {}).get("pollingUrl")
+                if polling_url and session_id:
+                    for _ in range(5):
+                        time.sleep(1)
+                        poll_resp = requests.get(polling_url, headers=headers, params={"sessionId": session_id})
+                        poll_resp.raise_for_status()
+                        data = poll_resp.json()
+                        status = data.get("data", {}).get("context", {}).get("status")
+                        if status == "complete":
+                            break
+                else:
+                    logger.warning("Incomplete results but no polling info provided")
+
             return self._process_flight_results(data, return_date)
         except Exception as e:
             logger.error(f"Error getting flights: {str(e)}")
